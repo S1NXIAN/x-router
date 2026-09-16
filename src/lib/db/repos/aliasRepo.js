@@ -1,7 +1,7 @@
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 import { makeKv } from "../helpers/kvStore.js";
-
+import { getSupabase, invalidateCache } from "../supabase.js";
 const aliasKv = makeKv("modelAliases");
 const customKv = makeKv("customModels");
 const mitmKv = makeKv("mitmAlias");
@@ -31,22 +31,35 @@ export async function getCustomModels() {
 
 // Atomic upsert inside transaction to prevent duplicate races.
 // Re-adding an existing model updates caps/name without resetting omitted fields.
+// Dual-write: local tx is the atomicity boundary; the final value mirrors remote.
 export async function addCustomModel({ providerAlias, id, type = "llm", name, caps }) {
   const k = customKey(providerAlias, id, type);
   const db = await getAdapter();
   let added = false;
+  let finalValue = null;
   db.transaction(() => {
     const row = db.get(`SELECT value FROM kv WHERE scope = 'customModels' AND key = ?`, [k]);
     if (row) {
       const prev = parseJson(row.value) || {};
       const next = { ...prev, ...(name ? { name } : {}), ...(caps ? { caps } : {}) };
       db.run(`UPDATE kv SET value = ? WHERE scope = 'customModels' AND key = ?`, [stringifyJson(next), k]);
+      finalValue = next;
       return;
     }
-    const value = stringifyJson({ providerAlias, id, type, name: name || id, ...(caps ? { caps } : {}) });
-    db.run(`INSERT INTO kv(scope, key, value) VALUES('customModels', ?, ?)`, [k, value]);
+    finalValue = { providerAlias, id, type, name: name || id, ...(caps ? { caps } : {}) };
+    db.run(`INSERT INTO kv(scope, key, value) VALUES('customModels', ?, ?)`, [k, stringifyJson(finalValue)]);
     added = true;
   });
+  const sb = getSupabase();
+  if (sb && finalValue) {
+    try {
+      const { error } = await sb.from("kv").upsert({ scope: "customModels", key: k, value: finalValue });
+      if (error) throw error;
+    } catch (err) {
+      console.warn(`[supabase] kv:customModels failed, using local SQLite fallback: ${err?.message || err}`);
+    }
+    invalidateCache("kv:customModels");
+  }
   return added;
 }
 

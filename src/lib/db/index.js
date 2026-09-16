@@ -1,7 +1,7 @@
 // Public API barrel — all DB functions
 import { getAdapter } from "./driver.js";
 import { stringifyJson, parseJson } from "./helpers/jsonCol.js";
-
+export { isSupabaseEnabled, invalidateCache as invalidateRemoteCache } from "./supabase.js";
 // Settings
 export {
   getSettings, updateSettings, isCloudEnabled, getCloudUrl, exportSettings,
@@ -162,7 +162,67 @@ export async function importDb(payload) {
     }
   });
 
+  await mirrorImportRemote(payload);
+
   return await exportDb();
+}
+
+// Mirror the full replace remote so a restore/import doesn't diverge the
+// mirror. Best-effort: remote failure is logged, local stays source of truth.
+async function mirrorImportRemote(payload) {
+  try {
+    const { getSupabase, invalidateCache } = await import("./supabase.js");
+    const sb = getSupabase();
+    if (!sb) return;
+    const now = new Date().toISOString();
+    const wipe = [
+      sb.from("providerConnections").delete().neq("id", "00000000-0000-0000-0000-000000000000"),
+      sb.from("providerNodes").delete().neq("id", "00000000-0000-0000-0000-000000000000"),
+      sb.from("proxyPools").delete().neq("id", "00000000-0000-0000-0000-000000000000"),
+      sb.from("apiKeys").delete().neq("id", "00000000-0000-0000-0000-000000000000"),
+      sb.from("combos").delete().neq("id", "00000000-0000-0000-0000-000000000000"),
+      sb.from("settings").delete().neq("id", -1),
+      sb.from("kv").delete().neq("scope", ""),
+    ];
+    for (const q of wipe) {
+      const { error } = await q;
+      if (error) throw error;
+    }
+    const puts = [];
+    if (payload.settings) puts.push(sb.from("settings").upsert({ id: 1, data: payload.settings }));
+    const conns = (payload.providerConnections || []).map((c) => {
+      const { id, provider, authType, name, email, priority, isActive, createdAt, updatedAt, ...rest } = c;
+      return { id, provider, authType: authType || "oauth", name: name ?? null, email: email ?? null, priority: priority ?? null, isActive: isActive !== false, data: rest, createdAt: createdAt || now, updatedAt: updatedAt || now };
+    });
+    if (conns.length) puts.push(sb.from("providerConnections").insert(conns));
+    const nodes = (payload.providerNodes || []).map((n) => {
+      const { id, type, name, createdAt, updatedAt, ...rest } = n;
+      return { id, type: type ?? null, name: name ?? null, data: rest, createdAt: createdAt || now, updatedAt: updatedAt || now };
+    });
+    if (nodes.length) puts.push(sb.from("providerNodes").insert(nodes));
+    const pools = (payload.proxyPools || []).map((p) => {
+      const { id, isActive, testStatus, createdAt, updatedAt, ...rest } = p;
+      return { id, isActive: isActive !== false, testStatus: testStatus ?? "unknown", data: rest, createdAt: createdAt || now, updatedAt: updatedAt || now };
+    });
+    if (pools.length) puts.push(sb.from("proxyPools").insert(pools));
+    const keys = (payload.apiKeys || []).map((k) => ({ id: k.id, key: k.key, name: k.name ?? null, machineId: k.machineId ?? null, isActive: k.isActive !== false, createdAt: k.createdAt || now }));
+    if (keys.length) puts.push(sb.from("apiKeys").insert(keys));
+    const combos = (payload.combos || []).map((c) => ({ id: c.id, name: c.name, kind: c.kind ?? null, models: c.models || [], createdAt: c.createdAt || now, updatedAt: c.updatedAt || now }));
+    if (combos.length) puts.push(sb.from("combos").insert(combos));
+    const kvRows = [];
+    for (const [a, m] of Object.entries(payload.modelAliases || {})) kvRows.push({ scope: "modelAliases", key: a, value: m });
+    for (const m of payload.customModels || []) kvRows.push({ scope: "customModels", key: `${m.providerAlias}|${m.id}|${m.type || "llm"}`, value: m });
+    for (const [tool, mappings] of Object.entries(payload.mitmAlias || {})) kvRows.push({ scope: "mitmAlias", key: tool, value: mappings || {} });
+    for (const [provider, models] of Object.entries(payload.pricing || {})) kvRows.push({ scope: "pricing", key: provider, value: models || {} });
+    if (kvRows.length) puts.push(sb.from("kv").insert(kvRows));
+    for (const q of puts) {
+      const { error } = await q;
+      if (error) throw error;
+    }
+    invalidateCache();
+  } catch (err) {
+    console.warn(`[supabase] importDb remote mirror failed, local SQLite is source of truth: ${err?.message || err}`);
+  }
 }
 
 // Eager init helper (optional)

@@ -1,6 +1,7 @@
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 import { makeKv } from "../helpers/kvStore.js";
+import { getSupabase, invalidateCache } from "../supabase.js";
 
 const pricingKv = makeKv("pricing");
 const CACHE_TTL_MS = 5000;
@@ -13,6 +14,24 @@ function invalidate() {
 
 async function getUserPricing() {
   return await pricingKv.getAll();
+}
+
+async function mirrorProvider(provider, next) {
+  const sb = getSupabase();
+  if (!sb) return;
+  try {
+    if (next === null) {
+      const { error } = await sb.from("kv").delete().eq("scope", "pricing").eq("key", provider);
+      if (error) throw error;
+    } else {
+      const { error } = await sb.from("kv").upsert({ scope: "pricing", key: provider, value: next });
+      if (error) throw error;
+    }
+  } catch (err) {
+    console.warn(`[supabase] kv:pricing failed, using local SQLite fallback: ${err?.message || err}`);
+  }
+  invalidateCache("kv:pricing");
+  invalidate();
 }
 
 export async function getPricing() {
@@ -56,9 +75,11 @@ export async function getPricingForModel(provider, model) {
   return resolveConst(provider, model);
 }
 
-// Atomic merge inside transaction (per-provider read-modify-write)
+// Atomic merge inside transaction (per-provider read-modify-write).
+// Dual-write: local tx is the atomicity boundary; merged payload mirrors remote.
 export async function updatePricing(pricingData) {
   const db = await getAdapter();
+  const mirrored = [];
   db.transaction(() => {
     for (const [provider, models] of Object.entries(pricingData)) {
       const row = db.get(`SELECT value FROM kv WHERE scope = 'pricing' AND key = ?`, [provider]);
@@ -71,8 +92,10 @@ export async function updatePricing(pricingData) {
         `INSERT INTO kv(scope, key, value) VALUES('pricing', ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value`,
         [provider, stringifyJson(merged)]
       );
+      mirrored.push([provider, merged]);
     }
   });
+  for (const [provider, merged] of mirrored) await mirrorProvider(provider, merged);
   invalidate();
   return await getUserPricing();
 }
@@ -80,9 +103,12 @@ export async function updatePricing(pricingData) {
 export async function resetPricing(provider, model) {
   if (!provider) return await getUserPricing();
   const db = await getAdapter();
+  let next = null;
+  let deleted = false;
   db.transaction(() => {
     if (!model) {
       db.run(`DELETE FROM kv WHERE scope = 'pricing' AND key = ?`, [provider]);
+      deleted = true;
       return;
     }
     const row = db.get(`SELECT value FROM kv WHERE scope = 'pricing' AND key = ?`, [provider]);
@@ -90,13 +116,16 @@ export async function resetPricing(provider, model) {
     delete current[model];
     if (Object.keys(current).length === 0) {
       db.run(`DELETE FROM kv WHERE scope = 'pricing' AND key = ?`, [provider]);
+      deleted = true;
     } else {
       db.run(
         `INSERT INTO kv(scope, key, value) VALUES('pricing', ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value`,
         [provider, stringifyJson(current)]
       );
+      next = current;
     }
   });
+  await mirrorProvider(provider, deleted ? null : next);
   invalidate();
   return await getUserPricing();
 }
