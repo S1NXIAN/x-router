@@ -11,7 +11,7 @@ services:
     name: x-router
     runtime: docker
     plan: free
-    branch: dev
+    branch: master
     region: singapore
     healthCheckPath: /api/health
     envVars:
