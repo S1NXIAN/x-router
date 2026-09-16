@@ -12,6 +12,7 @@ services:
     runtime: docker
     plan: free
     branch: dev
+    region: singapore
     healthCheckPath: /api/health
     envVars:
       - key: PORT
