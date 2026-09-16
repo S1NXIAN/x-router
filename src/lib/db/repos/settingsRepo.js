@@ -107,9 +107,14 @@ export async function getSettings() {
 }
 
 // Atomic read-merge-write inside transaction (prevents losing concurrent updates).
-// Dual-write: local tx is the atomicity boundary; merged payload mirrors remote.
+// Dual-write: local tx is the atomicity boundary. Shared state is folded into the
+// local merge first — the local disk is ephemeral (Render free tier), so after a
+// redeploy it holds a partial object that must not clobber remote keys saved
+// from the previous instance (e.g. per-provider round-robins).
 export async function updateSettings(updates) {
   let next;
+  // Remote-primary with local fallback + logging via cachedRead.
+  const remoteSettings = await readRaw().catch(() => ({}));
   await dualWrite(
     "settings",
     async (sb) => {
@@ -121,7 +126,7 @@ export async function updateSettings(updates) {
       db.transaction(function () {
         const row = db.get(`SELECT data FROM settings WHERE id = 1`);
         const current = row ? parseJson(row.data, {}) : {};
-        next = { ...current, ...updates };
+        next = { ...remoteSettings, ...current, ...updates };
         db.run(
           `INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
           [stringifyJson(next)],
