@@ -4,6 +4,8 @@
   # 9Router - FREE AI Router & Token Saver
   
   **Never stop coding. Save 20-40% tokens with RTK + auto-fallback to FREE & cheap AI models.**
+
+> **Fork notice:** this is a personal fork of [decolua/9router](https://github.com/decolua/9router), kept for purely personal use and deployed on the [Render](https://render.com) free tier. The only opinionated feature added on top of upstream so far is the Supabase remote-config mirror. Everything below is upstream documentation and applies unless noted — no support or SLA here; for the official project see upstream.
   
   **Connect All AI Code Tools (Claude Code, Cursor, Antigravity, Copilot, Codex, Gemini, OpenCode, Cline, OpenClaw...) to 40+ AI Providers & 100+ Models.**
   
